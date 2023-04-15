@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  EnvironmentPrefix:
+    Type: String
+    Default: "test-"
+  ImageId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  LocalZone:
+    Type: String
+    Default: "-lax-1"
+  InboundAdminCIDR:
+    Type: String
+
+Resources:
+
+  Ec2VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: True
+      EnableDnsSupport: True
+
+  Ec2SubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.64.0/18
+      VpcId: !Ref Ec2VPC
+      AvailabilityZone: !Sub "${AWS::Region}${LocalZone}a"
+      MapPublicIpOnLaunch: true
+
+  Ec2SubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.128.0/18
+      VpcId: !Ref Ec2VPC
+      AvailabilityZone: !Sub "${AWS::Region}${LocalZone}b"
+      MapPublicIpOnLaunch: true
+
+  StackRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      VpcId: !Ref Ec2VPC
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentPrefix}rtb"
+
+  StackRouteExternal:
+    Type: AWS::EC2::Route
+    Properties: 
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref TheInternetGateway
+      RouteTableId: !Ref StackRouteTable
+
+  SubnetRouteAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref StackRouteTable
+      SubnetId: !Ref Ec2SubnetOne
+
+  SubnetRouteAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref StackRouteTable
+      SubnetId: !Ref Ec2SubnetTwo
+  
+  TheInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentPrefix}igw"
+    
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      InternetGatewayId: !Ref TheInternetGateway
+      VpcId: !Ref Ec2VPC
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: Ec2VPC
+    Properties:
+      GroupDescription: SG to test ping
+      VpcId: !Ref Ec2VPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref InboundAdminCIDR
+        - IpProtocol: tcp
+          FromPort: 51311
+          ToPort: 51311
+          CidrIp: 0.0.0.0/0
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: !Sub "${AWS::StackName}-ec2-profile"
+      Roles: 
+        - !Ref IamInstanceRole
+
+  IamInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: InlinePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - "ecs:*"
+                - "log:*"
+                - "ecr:*"
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                - "ssm:PutParameter"
+                Resource: "*"
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      KeyName: !Ref KeyName
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref Ec2SubnetOne
+      SecurityGroupIds:
+      - !GetAtt Ec2SecurityGroup.GroupId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      BlockDeviceMappings:
+        -
+          DeviceName: /dev/xvda
+          Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              DeleteOnTermination: false
+      UserData:
+        Fn::Base64: !Sub |
+            #!/bin/bash -xe
+
+            yum update -y
+            yum install docker -y
+            systemctl start docker
+            docker pull apache/couchdb
+
+            PASSWORD=$(dd status=none if=/dev/random count=1 | sha256sum |cut -c-32)
+            aws ssm put-parameter --name ${EnvironmentPrefix}couchdb-admin --type String --value $PASSWORD --region ${AWS::Region} --overwrite
+
+            cd /root
+
+            cat >Dockerfile <<EOF
+            FROM couchdb:latest
+            EXPOSE 5984
+            COPY setup.sh setup.sh
+            ARG ADMIN_PASSWORD
+            ENV ADMIN_PASSWORD=\$ADMIN_PASSWORD
+            RUN sh setup.sh
+            EOF
+
+            cat >setup.sh <<EOF
+            cat >/opt/couchdb/etc/local.ini <<XOF
+            [couchdb]
+            single_node=true
+            
+            [admins]
+            dbadmin = \$ADMIN_PASSWORD
+            
+            [chttpd]
+            require_valid_user = false
+            XOF
+            
+            /docker-entrypoint.sh /opt/couchdb/bin/couchdb &
+            sleep 15
+            
+            curl -sX PUT http://dbadmin:$ADMIN_PASSWORD@127.0.0.1:5984/_users
+            curl -sX PUT http://dbadmin:$ADMIN_PASSWORD@127.0.0.1:5984/_replicator
+            EOF
+
+            docker build -t couchdb_local . --build-arg ADMIN_PASSWORD=$PASSWORD
+
+            chmod +x /etc/rc.local
+            mkdir /data
+            chmod 777 /data
+            echo "systemctl start docker && docker run -p 51311:5984 -v/data:/opt/couchdb/data -t couchdb_local" >> /etc/rc.local
+            /etc/rc.local &
+
+            # CloudFormation integration
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfiguration --configsets MountConfig --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
